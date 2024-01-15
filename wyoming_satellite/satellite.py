@@ -172,19 +172,25 @@ class SatelliteBase:
 
     async def event_from_server(self, event: Event) -> None:
         """Called when an event is received from the server."""
+        _LOGGER.debug("Running event from server")
+        _LOGGER.debug(event)
         if AudioChunk.is_type(event.type):
             # TTS audio
+            _LOGGER.debug("event_from_server: AudioChunk")
             await self.event_to_snd(event)
         elif AudioStart.is_type(event.type):
             # TTS started
+            _LOGGER.debug("event_from_server: AudioStart")
             await self.event_to_snd(event)
             await self.trigger_tts_start()
         elif AudioStop.is_type(event.type):
             # TTS stopped
+            _LOGGER.debug("event_from_server: AudioStop")
             await self.event_to_snd(event)
             await self.trigger_tts_stop()
         elif Detect.is_type(event.type):
             # Wake word detection started
+            _LOGGER.debug("event_from_server: Detect")
             await self.trigger_detect()
         elif Detection.is_type(event.type):
             # Wake word detected
@@ -192,19 +198,24 @@ class SatelliteBase:
             await self.trigger_detection(Detection.from_event(event))
         elif VoiceStarted.is_type(event.type):
             # STT start
+            _LOGGER.debug("event_from_server: VoiceStarted")
             await self.trigger_stt_start()
         elif VoiceStopped.is_type(event.type):
             # STT stop
+            _LOGGER.debug("event_from_server: VoiceStopped")
             await self.trigger_stt_stop()
         elif Transcript.is_type(event.type):
             # STT text
+            _LOGGER.debug("event_from_server: Transcript")
             _LOGGER.debug(event)
             await self.trigger_transcript(Transcript.from_event(event))
         elif Synthesize.is_type(event.type):
             # TTS request
+            _LOGGER.debug("event_from_server: Synthesize")
             _LOGGER.debug(event)
             await self.trigger_synthesize(Synthesize.from_event(event))
         elif Error.is_type(event.type):
+            _LOGGER.debug("event_from_server: Error")
             _LOGGER.warning(event)
             await self.trigger_error(Error.from_event(event))
 
@@ -366,6 +377,7 @@ class SatelliteBase:
                     continue
 
                 # Audio processing
+                _LOGGER.debug("Processing Microphone Audio")
                 if self.settings.mic.needs_processing and AudioChunk.is_type(
                     event.type
                 ):
@@ -600,8 +612,11 @@ class SatelliteBase:
 
                 if to_client_task in done:
                     # Event to go to wake service (audio)
+
                     assert to_client_task is not None
                     event = to_client_task.result()
+                    _LOGGER.debug("Wake To Client Task")
+                    _LOGGER.debug(event)
                     to_client_task = None
                     await wake_client.write_event(event)
 
@@ -609,6 +624,8 @@ class SatelliteBase:
                     # Event from wake service (detection)
                     assert from_client_task is not None
                     event = from_client_task.result()
+                    _LOGGER.debug("Wake From Client Task")
+                    _LOGGER.debug(event)
                     from_client_task = None
 
                     if event is None:
