@@ -377,7 +377,7 @@ class SatelliteBase:
                     continue
 
                 # Audio processing
-                _LOGGER.debug("Processing Microphone Audio")
+                _LOGGER.debug("Event From Mic")
                 if self.settings.mic.needs_processing and AudioChunk.is_type(
                     event.type
                 ):
@@ -405,6 +405,7 @@ class SatelliteBase:
 
     def _process_mic_audio(self, audio_bytes: bytes) -> bytes:
         """Perform audio pre-processing on mic input."""
+        _LOGGER.debug("Processing Audio")
         if self.settings.mic.volume_multiplier != 1.0:
             audio_bytes = multiply_volume(
                 audio_bytes, self.settings.mic.volume_multiplier
@@ -467,6 +468,8 @@ class SatelliteBase:
                     _LOGGER.debug("Connected to snd service")
 
                 # Audio processing
+                _LOGGER.debug("Sound Event")
+
                 if self.settings.snd.needs_processing and AudioChunk.is_type(
                     event.type
                 ):
@@ -499,6 +502,7 @@ class SatelliteBase:
 
     def _process_snd_audio(self, audio_bytes: bytes) -> bytes:
         """Perform audio pre-processing on snd output."""
+        _LOGGER.debug("Processing Sound Audio")
         if self.settings.snd.volume_multiplier != 1.0:
             audio_bytes = multiply_volume(
                 audio_bytes, self.settings.snd.volume_multiplier
@@ -510,6 +514,7 @@ class SatelliteBase:
         """Send WAV as events to sound service."""
         if (not wav_path) or (not self.settings.snd.enabled):
             return
+        _LOGGER.debug("Playing Wav File")
 
         for event in wav_to_events(
             wav_path,
@@ -597,6 +602,8 @@ class SatelliteBase:
                     to_client_task = asyncio.create_task(
                         self._wake_queue.get(), name="wake_to_client"
                     )
+                    _LOGGER.debug("Created Wake To Client Task")
+                    _LOGGER.debug(to_client_task)
                     pending.add(to_client_task)
 
                 if from_client_task is None:
@@ -604,6 +611,8 @@ class SatelliteBase:
                     from_client_task = asyncio.create_task(
                         wake_client.read_event(), name="wake_from_client"
                     )
+                    _LOGGER.debug("Created Wake From Client Task")
+                    _LOGGER.debug(from_client_task)
                     pending.add(from_client_task)
 
                 done, pending = await asyncio.wait(
