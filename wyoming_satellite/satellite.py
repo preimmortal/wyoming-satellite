@@ -92,7 +92,7 @@ class SatelliteBase:
 
     async def run(self) -> None:
         """Run main satellite loop."""
-
+        _LOGGER.debug("Starting Run")
         while self.is_running:
             try:
                 if self.state == State.NOT_STARTED:
@@ -111,6 +111,7 @@ class SatelliteBase:
                     # Automatically restart
                     _LOGGER.exception("Unexpected error running satellite")
                     self.state = State.RESTARTING
+        _LOGGER.debug("Ending Run")
 
     async def stop(self) -> None:
         """Stop the satellite"""
@@ -377,7 +378,6 @@ class SatelliteBase:
                     continue
 
                 # Audio processing
-                _LOGGER.debug("Processing Microphone Audio")
                 if self.settings.mic.needs_processing and AudioChunk.is_type(
                     event.type
                 ):
@@ -467,6 +467,8 @@ class SatelliteBase:
                     _LOGGER.debug("Connected to snd service")
 
                 # Audio processing
+                _LOGGER.debug("Sound Event")
+
                 if self.settings.snd.needs_processing and AudioChunk.is_type(
                     event.type
                 ):
@@ -495,10 +497,12 @@ class SatelliteBase:
                 self._snd_queue = None
                 await asyncio.sleep(self.settings.snd.reconnect_seconds)
 
+        _LOGGER.debug("Sound Event Disconnect")
         await _disconnect()
 
     def _process_snd_audio(self, audio_bytes: bytes) -> bytes:
         """Perform audio pre-processing on snd output."""
+        _LOGGER.debug("Processing Sound Audio")
         if self.settings.snd.volume_multiplier != 1.0:
             audio_bytes = multiply_volume(
                 audio_bytes, self.settings.snd.volume_multiplier
@@ -510,6 +514,7 @@ class SatelliteBase:
         """Send WAV as events to sound service."""
         if (not wav_path) or (not self.settings.snd.enabled):
             return
+        _LOGGER.debug("Playing Wav File")
 
         for event in wav_to_events(
             wav_path,
@@ -615,8 +620,6 @@ class SatelliteBase:
 
                     assert to_client_task is not None
                     event = to_client_task.result()
-                    _LOGGER.debug("Wake To Client Task")
-                    _LOGGER.debug(event)
                     to_client_task = None
                     await wake_client.write_event(event)
 
@@ -624,8 +627,6 @@ class SatelliteBase:
                     # Event from wake service (detection)
                     assert from_client_task is not None
                     event = from_client_task.result()
-                    _LOGGER.debug("Wake From Client Task")
-                    _LOGGER.debug(event)
                     from_client_task = None
 
                     if event is None:
