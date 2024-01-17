@@ -3,9 +3,10 @@ import asyncio
 import logging
 import math
 import time
+import wave
 from enum import Enum, auto
 from pathlib import Path
-from typing import Callable, Dict, Optional, Set, Union
+from typing import Callable, Dict, Final, Optional, Set, Union
 
 from pyring_buffer import RingBuffer
 from wyoming.asr import Transcript
@@ -14,8 +15,15 @@ from wyoming.client import AsyncClient
 from wyoming.error import Error
 from wyoming.event import Event, async_write_event
 from wyoming.mic import MicProcessAsyncClient
+from wyoming.ping import Ping, Pong
 from wyoming.pipeline import PipelineStage, RunPipeline
-from wyoming.satellite import RunSatellite, StreamingStarted, StreamingStopped
+from wyoming.satellite import (
+    RunSatellite,
+    SatelliteConnected,
+    SatelliteDisconnected,
+    StreamingStarted,
+    StreamingStopped,
+)
 from wyoming.snd import SndProcessAsyncClient
 from wyoming.tts import Synthesize
 from wyoming.vad import VoiceStarted, VoiceStopped
@@ -27,6 +35,9 @@ from .vad import SileroVad
 from .webrtc import WebRtcAudio
 
 _LOGGER = logging.getLogger()
+
+_PONG_TIMEOUT: Final = 5
+_PING_SEND_DELAY: Final = 2
 
 
 class State(Enum):
@@ -59,6 +70,12 @@ class SatelliteBase:
         self._wake_queue: "Optional[asyncio.Queue[Event]]" = None
         self._event_task: Optional[asyncio.Task] = None
         self._event_queue: "Optional[asyncio.Queue[Event]]" = None
+
+        self._pong_received_event = asyncio.Event()
+        self._ping_server_task = asyncio.create_task(self._ping_server(), name="ping")
+
+        self.microphone_muted = False
+        self._unmute_microphone_task: Optional[asyncio.Task] = None
 
         # Debug audio recording
         self.wake_audio_writer: Optional[DebugAudioWriter] = None
@@ -121,17 +138,19 @@ class SatelliteBase:
         while self.state != State.STOPPED:
             await self._state_changed.wait()
 
-    def set_server(self, server_id: str, writer: asyncio.StreamWriter) -> None:
+    async def set_server(self, server_id: str, writer: asyncio.StreamWriter) -> None:
         """Set event writer."""
         self.server_id = server_id
         self._writer = writer
         _LOGGER.debug("Server set: %s", server_id)
+        await self.trigger_server_connected()
 
-    def clear_server(self) -> None:
+    async def clear_server(self) -> None:
         """Remove writer."""
         self.server_id = None
         self._writer = None
         _LOGGER.debug("Server disconnected")
+        await self.trigger_server_disonnected()
 
     async def event_to_server(self, event: Event) -> None:
         """Send an event to the server."""
@@ -141,12 +160,37 @@ class SatelliteBase:
         try:
             await async_write_event(event, self._writer)
         except Exception as err:
-            self.clear_server()
+            await self.clear_server()
 
             if isinstance(err, ConnectionResetError):
                 _LOGGER.warning("Server disconnected unexpectedly")
             else:
                 _LOGGER.exception("Unexpected error sending event to server")
+
+    async def _ping_server(self) -> None:
+        try:
+            while self.is_running:
+                await asyncio.sleep(_PING_SEND_DELAY)
+                if self.server_id is None:
+                    # No server connected
+                    continue
+
+                # Send ping and wait for pong
+                self._pong_received_event.clear()
+                await self.event_to_server(Ping().event())
+                try:
+                    await asyncio.wait_for(
+                        self._pong_received_event.wait(), timeout=_PONG_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    if self.server_id is None:
+                        # No server connected
+                        continue
+
+                    _LOGGER.warning("Did not receive ping response within timeout")
+                    await self.clear_server()
+        except Exception:
+            _LOGGER.exception("Unexpected error in ping server task")
 
     # -------------------------------------------------------------------------
 
@@ -173,9 +217,14 @@ class SatelliteBase:
 
     async def event_from_server(self, event: Event) -> None:
         """Called when an event is received from the server."""
-        _LOGGER.debug("Running event from server")
-        _LOGGER.debug(event)
-        if AudioChunk.is_type(event.type):
+        if Ping.is_type(event.type):
+            # Respond with pong
+            ping = Ping.from_event(event)
+            await self.event_to_server(Pong(text=ping.text).event())
+        elif Pong.is_type(event.type):
+            # Response from our ping
+            self._pong_received_event.set()
+        elif AudioChunk.is_type(event.type):
             # TTS audio
             _LOGGER.debug("event_from_server: AudioChunk")
             await self.event_to_snd(event)
@@ -229,9 +278,11 @@ class SatelliteBase:
         if self.settings.wake.enabled:
             # Local wake word detection
             start_stage = PipelineStage.ASR
+            restart_on_end = False
         else:
             # Remote wake word detection
             start_stage = PipelineStage.WAKE
+            restart_on_end = not self.settings.vad.enabled
 
         if self.settings.snd.enabled:
             # Play TTS response
@@ -240,7 +291,9 @@ class SatelliteBase:
             # No audio output
             end_stage = PipelineStage.HANDLE
 
-        run_pipeline = RunPipeline(start_stage=start_stage, end_stage=end_stage).event()
+        run_pipeline = RunPipeline(
+            start_stage=start_stage, end_stage=end_stage, restart_on_end=restart_on_end
+        ).event()
         await self.event_to_server(run_pipeline)
         await self.forward_event(run_pipeline)
 
@@ -510,18 +563,42 @@ class SatelliteBase:
 
         return audio_bytes
 
-    async def _play_wav(self, wav_path: Optional[Union[str, Path]]) -> None:
+    async def _play_wav(
+        self, wav_path: Optional[Union[str, Path]], mute_microphone: bool = False
+    ) -> None:
         """Send WAV as events to sound service."""
         if (not wav_path) or (not self.settings.snd.enabled):
             return
         _LOGGER.debug("Playing Wav File")
 
-        for event in wav_to_events(
-            wav_path,
-            samples_per_chunk=self.settings.snd.samples_per_chunk,
-            volume_multiplier=self.settings.snd.volume_multiplier,
-        ):
-            await self.event_to_snd(event)
+        try:
+            if mute_microphone:
+                with wave.open(str(wav_path), "rb") as wav_file:
+                    seconds_to_mute = wav_file.getnframes() / wav_file.getframerate()
+
+                seconds_to_mute += self.settings.mic.seconds_to_mute_after_awake_wav
+                _LOGGER.debug("Muting microphone for %s second(s)", seconds_to_mute)
+                self.microphone_muted = True
+                self._unmute_microphone_task = asyncio.create_task(
+                    self._unmute_microphone_after(seconds_to_mute)
+                )
+
+            for event in wav_to_events(
+                wav_path,
+                samples_per_chunk=self.settings.snd.samples_per_chunk,
+                volume_multiplier=self.settings.snd.volume_multiplier,
+            ):
+                await self.event_to_snd(event)
+        except Exception:
+            # Unmute in case of an error
+            self.microphone_muted = False
+
+            raise
+
+    async def _unmute_microphone_after(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
+        self.microphone_muted = False
+        _LOGGER.debug("Unmuted microphone")
 
     # -------------------------------------------------------------------------
     # Wake
@@ -657,6 +734,18 @@ class SatelliteBase:
     # Events
     # -------------------------------------------------------------------------
 
+    async def trigger_server_connected(self) -> None:
+        """Called when connected to server."""
+        _LOGGER.info("Connected to server")
+        await run_event_command(self.settings.event.connected)
+        await self.forward_event(SatelliteConnected().event())
+
+    async def trigger_server_disonnected(self) -> None:
+        """Called when disconnected from server."""
+        _LOGGER.info("Disconnected from server")
+        await run_event_command(self.settings.event.disconnected)
+        await self.forward_event(SatelliteDisconnected().event())
+
     async def trigger_streaming_start(self) -> None:
         """Called when audio streaming starts."""
         await run_event_command(self.settings.event.streaming_start)
@@ -674,7 +763,10 @@ class SatelliteBase:
     async def trigger_detection(self, detection: Detection) -> None:
         """Called when wake word is detected."""
         await run_event_command(self.settings.event.detection, detection.name)
-        await self._play_wav(self.settings.snd.awake_wav)
+        await self._play_wav(
+            self.settings.snd.awake_wav,
+            mute_microphone=self.settings.mic.mute_during_awake_wav,
+        )
 
     async def trigger_transcript(self, transcript: Transcript) -> None:
         """Called when speech-to-text text is received."""
@@ -782,22 +874,23 @@ class AlwaysStreamingSatellite(SatelliteBase):
             # Start debug recording
             if self.stt_audio_writer is not None:
                 self.stt_audio_writer.start()
-        elif Transcript.is_type(event.type):
+        elif Transcript.is_type(event.type) or Error.is_type(event.type):
             # Stop debug recording
             if self.stt_audio_writer is not None:
                 self.stt_audio_writer.stop()
 
-            # We're always streaming
-            _LOGGER.info("Streaming audio")
+            if Transcript.is_type(event.type):
+                # We're always streaming
+                _LOGGER.info("Streaming audio")
 
-            # Re-trigger streaming start even though we technically don't stop
-            # so the event service can reset LEDs, etc.
-            await self.trigger_streaming_start()
+                # Re-trigger streaming start even though we technically don't stop
+                # so the event service can reset LEDs, etc.
+                await self.trigger_streaming_start()
 
     async def event_from_mic(
         self, event: Event, audio_bytes: Optional[bytes] = None
     ) -> None:
-        if not self.is_streaming:
+        if (not self.is_streaming) or self.microphone_muted:
             return
 
         if AudioChunk.is_type(event.type):
@@ -853,7 +946,9 @@ class VadStreamingSatellite(SatelliteBase):
             # Start debug recording
             if self.stt_audio_writer is not None:
                 self.stt_audio_writer.start()
-        elif Transcript.is_type(event.type):
+        elif Transcript.is_type(event.type) or Error.is_type(event.type):
+            self.is_streaming = False
+
             # Stop debug recording
             if self.stt_audio_writer is not None:
                 self.stt_audio_writer.stop()
@@ -861,7 +956,7 @@ class VadStreamingSatellite(SatelliteBase):
     async def event_from_mic(
         self, event: Event, audio_bytes: Optional[bytes] = None
     ) -> None:
-        if not AudioChunk.is_type(event.type):
+        if (not AudioChunk.is_type(event.type)) or self.microphone_muted:
             return
 
         # Only unpack chunk once
@@ -986,11 +1081,14 @@ class WakeStreamingSatellite(SatelliteBase):
         # Only check event types once
         is_run_satellite = False
         is_transcript = False
+        is_error = False
 
         if RunSatellite.is_type(event.type):
             is_run_satellite = True
         elif Transcript.is_type(event.type):
             is_transcript = True
+        elif Error.is_type(event.type):
+            is_error = True
 
         if is_transcript:
             # Stop streaming before event_from_server is called because it will
@@ -1003,7 +1101,7 @@ class WakeStreamingSatellite(SatelliteBase):
 
         await super().event_from_server(event)
 
-        if is_run_satellite or is_transcript:
+        if is_run_satellite or is_transcript or is_error:
             # Stop streaming and go back to wake word detection
             self.is_streaming = False
             await self.trigger_streaming_stop()
@@ -1015,10 +1113,21 @@ class WakeStreamingSatellite(SatelliteBase):
             if self.wake_audio_writer is not None:
                 self.wake_audio_writer.start(timestamp=self._debug_recording_timestamp)
 
+    async def trigger_server_disonnected(self) -> None:
+        await super().trigger_server_disonnected()
+
+        self.is_streaming = False
+
+        # Stop debug recording (stt)
+        if self.stt_audio_writer is not None:
+            self.stt_audio_writer.stop()
+
+        await self.trigger_streaming_stop()
+
     async def event_from_mic(
         self, event: Event, audio_bytes: Optional[bytes] = None
     ) -> None:
-        if not AudioChunk.is_type(event.type):
+        if (not AudioChunk.is_type(event.type)) or self.microphone_muted:
             return
 
         # Debug audio recording
@@ -1041,7 +1150,8 @@ class WakeStreamingSatellite(SatelliteBase):
             await self.event_to_wake(event)
 
     async def event_from_wake(self, event: Event) -> None:
-        if self.is_streaming:
+        if self.is_streaming or (self.server_id is None):
+            # Not streaming or no server connected
             return
 
         if Detection.is_type(event.type):
